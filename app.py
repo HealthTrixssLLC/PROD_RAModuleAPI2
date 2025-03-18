@@ -65,11 +65,9 @@ class Diagnosis(BaseModel):
     FromDOS: str
     ThruDOS: str
     DxCode: str
-    QualificationFlag: int
-    UnqualificationReason: str
 
 class ProcessDataRequest(BaseModel):
-    dos_year: int
+    payment_year: int
     memberships: List[Membership]
     diagnoses: List[Diagnosis]
 
@@ -78,7 +76,7 @@ def get_db_connection():
     try:
         conn = pymssql.connect(
             server='10.10.1.4',
-            database='RAModuleQA',
+            database='RAModule2',
             user='etl_user',
             password='etl_user',
             port='1433',
@@ -143,26 +141,23 @@ def create_temp_tables(cursor):
         MemberID VARCHAR(50) NOT NULL,
         FromDOS DATE NOT NULL,
         ThruDOS DATE NOT NULL,
-        DxCode VARCHAR(20) NOT NULL,
-        QualificationFlag int NOT NULL,
-	    UnqualificationReason VARCHAR(20)
-                   
+        DxCode VARCHAR(20) NOT NULL
     );
     """)
 
 @lru_cache(maxsize=CACHE_SIZE)
-def process_data_with_sp_cached(dos_year: int, memberships_tuple: tuple, diagnoses_tuple: tuple):
+def process_data_with_sp_cached(payment_year: int, memberships_tuple: tuple, diagnoses_tuple: tuple):
     """Cached version of the data processing function."""
     try:
         memberships = [dict(m) for m in memberships_tuple]
         diagnoses = [dict(d) for d in diagnoses_tuple]
         with get_db_cursor() as cursor:
-            return process_data_with_sp(cursor, dos_year, memberships, diagnoses)
+            return process_data_with_sp(cursor, payment_year, memberships, diagnoses)
     except Exception as e:
         logger.error(f"Cache processing error: {str(e)}")
         raise
 
-def process_data_with_sp(cursor, dos_year, memberships, diagnoses):
+def process_data_with_sp(cursor, payment_year, memberships, diagnoses):
     """Process data using the stored procedure."""
     try:
         create_temp_tables(cursor)
@@ -200,21 +195,19 @@ def process_data_with_sp(cursor, dos_year, memberships, diagnoses):
             for _, row in batch.iterrows():
                 cursor.execute("""
                     INSERT INTO #TempDiagnosis 
-                    VALUES (%s, %s, %s, %s,%s,%s)
+                    VALUES (%s, %s, %s, %s)
                 """, (
                     str(row.MemberID),
                     str(row.FromDOS),
                     str(row.ThruDOS),
-                    str(row.DxCode),
-                    int(row.QualificationFlag),
-                    str(row.UnqualificationReason)
+                    str(row.DxCode)
                 ))
  
         logger.info('Executing stored procedure...')
         cursor.execute("""
             DECLARE @PmtYear INT = %s;
-            Declare @Membership as InputMembership_PartC
-            Declare @DxTable as [InputDiagnosisSuspect_MVP1]
+            DECLARE @Membership AS InputMembership_PartC;
+            DECLARE @DxTable AS InputDiagnosis;
             
             INSERT INTO @Membership (
                 MemberID, BirthDate, Gender, RAType, 
@@ -225,15 +218,12 @@ def process_data_with_sp(cursor, dos_year, memberships, diagnoses):
                 Hospice, LTIMCAID, NEMCAID, OREC
             FROM #TempMembership;
             
-            INSERT INTO @DxTable (MemberID, FromDOS, ThruDOS, DxCode,QualificationFlag,UnqualificationReason)
-            SELECT MemberID, FromDOS, ThruDOS, DxCode,QualificationFlag,UnqualificationReason
+            INSERT INTO @DxTable (MemberID, FromDOS, ThruDOS, DxCode)
+            SELECT MemberID, FromDOS, ThruDOS, DxCode
             FROM #TempDiagnosis;
-   
-
-                       
  
-            EXEC dbo.sp_RS_Medicare_PartC_Outer_Suspect @PmtYear, @Membership, @DxTable,2;
-        """, (dos_year,))
+            EXEC dbo.sp_RS_Medicare_PartC_Outer @PmtYear, @Membership, @DxTable;
+        """, (payment_year,))
         
         results = cursor.fetchall()
         logger.info(f"Retrieved {len(results)} records from stored procedure")
@@ -259,7 +249,7 @@ async def process_data(request: ProcessDataRequest):
         
         try:
             results = process_data_with_sp_cached(
-                request.dos_year,
+                request.payment_year,
                 memberships_tuple,
                 diagnoses_tuple
             )
@@ -268,7 +258,7 @@ async def process_data(request: ProcessDataRequest):
             logger.error(f"Cache error: {str(e)}")
             process_data_with_sp_cached.cache_clear()
             results = process_data_with_sp_cached(
-                request.dos_year,
+                request.payment_year,
                 memberships_tuple,
                 diagnoses_tuple
             )
